@@ -140,7 +140,7 @@ class FreeFuseMaskFromImage:
                 covered = torch.zeros(target_h, target_w)
                 for m in seed_masks:
                     covered = torch.max(covered, m)
-                mask_dict["background"] = (1.0 - covered).clamp(0, 1)
+                mask_dict["_background_"] = (1.0 - covered).clamp(0, 1)
 
         return ({"masks": mask_dict},)
 
@@ -168,7 +168,7 @@ class FreeFuseMaskFromImage:
             bg_seed = (1.0 - covered).clamp(0, 1)
             # Only add background if there are uncovered pixels
             if bg_seed.sum() > 0:
-                all_names.append("background")
+                all_names.append("_background_")
                 all_seeds.append(bg_seed)
 
         C = len(all_names)
