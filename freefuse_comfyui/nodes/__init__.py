@@ -41,6 +41,7 @@ from .mask_tap import (
     FreeFuseMaskReassemble,
 )
 from .mask_from_image import FreeFuseMaskFromImage
+from .attention_bias_applicator import FreeFuseAttentionBiasApplicator
 
 # Combine all node mappings
 NODE_CLASS_MAPPINGS = {
@@ -56,6 +57,7 @@ NODE_CLASS_MAPPINGS = {
     "FreeFuseMaskTap": FreeFuseMaskTap,
     "FreeFuseMaskReassemble": FreeFuseMaskReassemble,
     "FreeFuseMaskFromImage": FreeFuseMaskFromImage,
+    "FreeFuseAttentionBiasApplicator": FreeFuseAttentionBiasApplicator,
     # Attention bias nodes
     "FreeFuseAttentionBias": FreeFuseAttentionBias,
     "FreeFuseAttentionBiasVisualize": FreeFuseAttentionBiasVisualize,
@@ -74,6 +76,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FreeFuseMaskTap": "FreeFuse Mask Tap",
     "FreeFuseMaskReassemble": "FreeFuse Mask Reassemble",
     "FreeFuseMaskFromImage": "FreeFuse Mask From Image",
+    "FreeFuseAttentionBiasApplicator": "FreeFuse Attention Bias Only",
     # Attention bias nodes
     "FreeFuseAttentionBias": "FreeFuse Attention Bias",
     "FreeFuseAttentionBiasVisualize": "FreeFuse Attention Bias Visualize",
@@ -95,6 +98,7 @@ __all__ = [
     "FreeFuseMaskTap",
     "FreeFuseMaskReassemble",
     "FreeFuseMaskFromImage",
+    "FreeFuseAttentionBiasApplicator",
     # Attention bias
     "FreeFuseAttentionBias",
     "FreeFuseAttentionBiasVisualize",
