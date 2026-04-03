@@ -4,9 +4,9 @@ FreeFuse Mask From Image
 Convert user-provided masks (ComfyUI MASK type) into FREEFUSE_MASKS,
 bypassing Phase 1 entirely. Each mask corresponds to one LoRA concept.
 
-Concept masks define where each LoRA is active. Use the dilation parameter
-to expand masks outward for stronger LoRA effect while keeping concept
-centers aligned with your subjects.
+Two strategies for strengthening LoRA effect with tight masks:
+- floor: base LoRA level everywhere, full strength in mask (keeps geometry)
+- dilation: expand mask boundary outward (changes geometry)
 """
 
 import torch
@@ -22,7 +22,7 @@ class FreeFuseMaskFromImage:
     Masks are resized to latent resolution automatically.
 
     White = LoRA active, Black = LoRA inactive.
-    Use dilation to expand masks for stronger LoRA effect.
+    Use floor and/or dilation to strengthen LoRA effect with tight masks.
     """
 
     MAX_CONCEPTS = 6
@@ -40,6 +40,21 @@ class FreeFuseMaskFromImage:
             "LATENT",
             {"tooltip": "Optional latent for target resolution reference"},
         )
+        optional["floor"] = (
+            "FLOAT",
+            {
+                "default": 0.0,
+                "min": 0.0,
+                "max": 1.0,
+                "step": 0.05,
+                "tooltip": (
+                    "Minimum LoRA strength outside the mask region. "
+                    "0.0 = hard mask (LoRA off outside). "
+                    "0.3 = 30% LoRA everywhere, 100% inside mask. "
+                    "Prevents attention dilution without changing mask shape."
+                ),
+            },
+        )
         optional["dilation"] = (
             "INT",
             {
@@ -48,10 +63,10 @@ class FreeFuseMaskFromImage:
                 "max": 100,
                 "step": 1,
                 "tooltip": (
-                    "Expand each mask by N pixels (in latent space). "
-                    "Higher = stronger LoRA effect but less precise boundaries. "
-                    "0 = use masks as-is. "
-                    "Try 10-20 for a balance of strength and precision."
+                    "Expand mask boundary by N pixels (latent space). "
+                    "0 = no expansion. "
+                    "10-20 = moderate expansion. "
+                    "Changes mask shape — use floor instead to keep geometry."
                 ),
             },
         )
@@ -66,11 +81,12 @@ class FreeFuseMaskFromImage:
         "Convert pixel masks into FreeFuse masks, bypassing Phase 1. "
         "Provide one mask per LoRA concept (in adapter order). "
         "White = LoRA active in that region. "
-        "Use dilation to expand masks for stronger LoRA effect."
+        "Use floor to set base LoRA level everywhere (keeps mask shape). "
+        "Use dilation to expand mask boundaries (changes shape)."
     )
 
-    def convert(self, freefuse_data, mask_1, latent=None, dilation=0,
-                **kwargs):
+    def convert(self, freefuse_data, mask_1, latent=None, floor=0.0,
+                dilation=0, **kwargs):
         adapters = freefuse_data.get("adapters", [])
         if not adapters:
             print("[FreeFuse MaskFromImage] Warning: No adapters in freefuse_data")
@@ -117,15 +133,18 @@ class FreeFuseMaskFromImage:
             concept_masks = self._dilate_masks(concept_masks, dilation)
 
         # Resolve overlaps: where masks overlap after dilation,
-        # assign to the concept whose original seed was closer (nearest-seed wins)
+        # assign to the concept whose original seed was closer
         if dilation > 0 and len(concept_masks) > 1:
             concept_masks = self._resolve_overlaps(
                 concept_masks,
-                # Use pre-dilation masks for distance priority
                 [self._resize_mask(input_masks[i], target_h, target_w)
                  for i in range(len(concept_masks))],
                 target_h, target_w,
             )
+
+        # Apply floor: raise minimum mask value outside masked regions
+        if floor > 0.0:
+            concept_masks = self._apply_floor(concept_masks, floor)
 
         # Build output
         mask_dict = {}
@@ -133,27 +152,42 @@ class FreeFuseMaskFromImage:
         for name, mask in zip(concept_names, concept_masks):
             mask_dict[name] = mask
             covered = torch.max(covered, mask)
-            coverage = mask.sum() / (target_h * target_w) * 100
+            coverage_full = (mask >= 1.0).sum() / (target_h * target_w) * 100
+            mean_val = mask.mean() * 100
             print(
                 f"[FreeFuse MaskFromImage] mask → '{name}' "
-                f"({target_h}x{target_w}, {coverage:.1f}% coverage)"
+                f"({target_h}x{target_w}, {coverage_full:.1f}% full, "
+                f"{mean_val:.1f}% mean strength)"
             )
 
-        # Background = uncovered regions
-        bg_mask = (1.0 - covered).clamp(0, 1)
+        # Background = regions not covered by any concept at full strength
+        # With floor > 0, background gets reduced since concepts have base presence
+        bg_mask = torch.ones(target_h, target_w)
+        for mask in concept_masks:
+            bg_mask = bg_mask * (1.0 - mask)
+        bg_mask = bg_mask.clamp(0, 1)
         mask_dict["_background_"] = bg_mask
-        bg_coverage = bg_mask.sum() / (target_h * target_w) * 100
-        print(f"[FreeFuse MaskFromImage] '_background_': {bg_coverage:.1f}% coverage")
+        bg_mean = bg_mask.mean() * 100
+        print(f"[FreeFuse MaskFromImage] '_background_': {bg_mean:.1f}% mean strength")
 
         return ({"masks": mask_dict},)
+
+    def _apply_floor(self, masks, floor):
+        """Raise minimum mask value to floor. Inside mask stays 1.0,
+        outside becomes floor instead of 0.0."""
+        result = []
+        for mask in masks:
+            floored = torch.where(mask > 0.5, torch.ones_like(mask),
+                                  torch.full_like(mask, floor))
+            result.append(floored)
+        return result
 
     def _dilate_masks(self, masks, dilation):
         """Expand each mask by `dilation` pixels using max pooling."""
         kernel = 2 * dilation + 1
         dilated = []
         for mask in masks:
-            # max_pool2d with large kernel = dilation
-            m = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            m = mask.unsqueeze(0).unsqueeze(0)
             m = F.max_pool2d(m, kernel_size=kernel, stride=1,
                              padding=dilation)
             dilated.append(m.squeeze(0).squeeze(0))
@@ -161,14 +195,13 @@ class FreeFuseMaskFromImage:
 
     def _resolve_overlaps(self, dilated_masks, seed_masks, h, w):
         """Where dilated masks overlap, assign pixel to nearest seed concept."""
-        stacked = torch.stack(dilated_masks, dim=0)  # (C, H, W)
-        overlap = (stacked.sum(dim=0) > 1).float()  # (H, W)
+        stacked = torch.stack(dilated_masks, dim=0)
+        overlap = (stacked.sum(dim=0) > 1).float()
 
         if overlap.sum() == 0:
-            return dilated_masks  # no overlaps
+            return dilated_masks
 
-        # Compute distance from each seed using iterative min-pool
-        seeds = torch.stack(seed_masks, dim=0)  # (C, H, W)
+        seeds = torch.stack(seed_masks, dim=0)
         C = seeds.shape[0]
         max_dist = float(h + w)
         distances = torch.where(
@@ -176,19 +209,17 @@ class FreeFuseMaskFromImage:
             torch.zeros(C, h, w),
             torch.full((C, h, w), max_dist),
         )
-        dist = distances.unsqueeze(0)  # (1, C, H, W)
+        dist = distances.unsqueeze(0)
         for _ in range(h + w):
             pooled = -F.max_pool2d(-dist, kernel_size=3, stride=1, padding=1)
             dist = torch.min(dist, pooled + 1.0)
             if (dist < max_dist).all():
                 break
-        distances = dist.squeeze(0)  # (C, H, W)
+        distances = dist.squeeze(0)
 
-        # In overlap regions, assign to nearest concept
-        nearest = distances.argmin(dim=0)  # (H, W)
+        nearest = distances.argmin(dim=0)
         result = []
         for i, mask in enumerate(dilated_masks):
-            # Keep non-overlap pixels as-is, resolve overlap by nearest
             resolved = mask.clone()
             overlap_region = overlap > 0
             resolved[overlap_region] = (nearest[overlap_region] == i).float()
