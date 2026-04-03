@@ -4,8 +4,9 @@ FreeFuse Mask From Image
 Convert user-provided masks (ComfyUI MASK type) into FREEFUSE_MASKS,
 bypassing Phase 1 entirely. Each mask corresponds to one LoRA concept.
 
-Concept masks define where each LoRA is active. Uncovered regions
-become background (no LoRA applied).
+Concept masks define where each LoRA is active. Use the dilation parameter
+to expand masks outward for stronger LoRA effect while keeping concept
+centers aligned with your subjects.
 """
 
 import torch
@@ -21,7 +22,7 @@ class FreeFuseMaskFromImage:
     Masks are resized to latent resolution automatically.
 
     White = LoRA active, Black = LoRA inactive.
-    Uncovered regions become background (no LoRA).
+    Use dilation to expand masks for stronger LoRA effect.
     """
 
     MAX_CONCEPTS = 6
@@ -39,6 +40,21 @@ class FreeFuseMaskFromImage:
             "LATENT",
             {"tooltip": "Optional latent for target resolution reference"},
         )
+        optional["dilation"] = (
+            "INT",
+            {
+                "default": 0,
+                "min": 0,
+                "max": 100,
+                "step": 1,
+                "tooltip": (
+                    "Expand each mask by N pixels (in latent space). "
+                    "Higher = stronger LoRA effect but less precise boundaries. "
+                    "0 = use masks as-is. "
+                    "Try 10-20 for a balance of strength and precision."
+                ),
+            },
+        )
         return {"required": required, "optional": optional}
 
     RETURN_TYPES = ("FREEFUSE_MASKS",)
@@ -50,10 +66,11 @@ class FreeFuseMaskFromImage:
         "Convert pixel masks into FreeFuse masks, bypassing Phase 1. "
         "Provide one mask per LoRA concept (in adapter order). "
         "White = LoRA active in that region. "
-        "Uncovered regions become background (no LoRA applied)."
+        "Use dilation to expand masks for stronger LoRA effect."
     )
 
-    def convert(self, freefuse_data, mask_1, latent=None, **kwargs):
+    def convert(self, freefuse_data, mask_1, latent=None, dilation=0,
+                **kwargs):
         adapters = freefuse_data.get("adapters", [])
         if not adapters:
             print("[FreeFuse MaskFromImage] Warning: No adapters in freefuse_data")
@@ -76,27 +93,51 @@ class FreeFuseMaskFromImage:
         # Determine target latent size
         target_h, target_w = self._get_target_size(input_masks[0], latent)
 
-        # Build mask dict
-        mask_dict = {}
-        covered = torch.zeros(target_h, target_w)
-
+        # Build concept masks at latent resolution
+        concept_names = []
+        concept_masks = []
         for i, adapter_info in enumerate(adapters):
             name = adapter_info.get("name")
             if not name:
                 continue
             if i < len(input_masks):
                 resized = self._resize_mask(input_masks[i], target_h, target_w)
-                mask_dict[name] = resized
-                covered = torch.max(covered, resized)
-                coverage = resized.sum() / (target_h * target_w) * 100
-                print(
-                    f"[FreeFuse MaskFromImage] mask_{i + 1} → '{name}' "
-                    f"({target_h}x{target_w}, {coverage:.1f}% coverage)"
-                )
+                concept_names.append(name)
+                concept_masks.append(resized)
             else:
                 print(
                     f"[FreeFuse MaskFromImage] No mask for adapter '{name}', skipping"
                 )
+
+        if not concept_masks:
+            return ({"masks": {}},)
+
+        # Apply dilation if requested
+        if dilation > 0:
+            concept_masks = self._dilate_masks(concept_masks, dilation)
+
+        # Resolve overlaps: where masks overlap after dilation,
+        # assign to the concept whose original seed was closer (nearest-seed wins)
+        if dilation > 0 and len(concept_masks) > 1:
+            concept_masks = self._resolve_overlaps(
+                concept_masks,
+                # Use pre-dilation masks for distance priority
+                [self._resize_mask(input_masks[i], target_h, target_w)
+                 for i in range(len(concept_masks))],
+                target_h, target_w,
+            )
+
+        # Build output
+        mask_dict = {}
+        covered = torch.zeros(target_h, target_w)
+        for name, mask in zip(concept_names, concept_masks):
+            mask_dict[name] = mask
+            covered = torch.max(covered, mask)
+            coverage = mask.sum() / (target_h * target_w) * 100
+            print(
+                f"[FreeFuse MaskFromImage] mask → '{name}' "
+                f"({target_h}x{target_w}, {coverage:.1f}% coverage)"
+            )
 
         # Background = uncovered regions
         bg_mask = (1.0 - covered).clamp(0, 1)
@@ -105,6 +146,55 @@ class FreeFuseMaskFromImage:
         print(f"[FreeFuse MaskFromImage] '_background_': {bg_coverage:.1f}% coverage")
 
         return ({"masks": mask_dict},)
+
+    def _dilate_masks(self, masks, dilation):
+        """Expand each mask by `dilation` pixels using max pooling."""
+        kernel = 2 * dilation + 1
+        dilated = []
+        for mask in masks:
+            # max_pool2d with large kernel = dilation
+            m = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            m = F.max_pool2d(m, kernel_size=kernel, stride=1,
+                             padding=dilation)
+            dilated.append(m.squeeze(0).squeeze(0))
+        return dilated
+
+    def _resolve_overlaps(self, dilated_masks, seed_masks, h, w):
+        """Where dilated masks overlap, assign pixel to nearest seed concept."""
+        stacked = torch.stack(dilated_masks, dim=0)  # (C, H, W)
+        overlap = (stacked.sum(dim=0) > 1).float()  # (H, W)
+
+        if overlap.sum() == 0:
+            return dilated_masks  # no overlaps
+
+        # Compute distance from each seed using iterative min-pool
+        seeds = torch.stack(seed_masks, dim=0)  # (C, H, W)
+        C = seeds.shape[0]
+        max_dist = float(h + w)
+        distances = torch.where(
+            seeds > 0.5,
+            torch.zeros(C, h, w),
+            torch.full((C, h, w), max_dist),
+        )
+        dist = distances.unsqueeze(0)  # (1, C, H, W)
+        for _ in range(h + w):
+            pooled = -F.max_pool2d(-dist, kernel_size=3, stride=1, padding=1)
+            dist = torch.min(dist, pooled + 1.0)
+            if (dist < max_dist).all():
+                break
+        distances = dist.squeeze(0)  # (C, H, W)
+
+        # In overlap regions, assign to nearest concept
+        nearest = distances.argmin(dim=0)  # (H, W)
+        result = []
+        for i, mask in enumerate(dilated_masks):
+            # Keep non-overlap pixels as-is, resolve overlap by nearest
+            resolved = mask.clone()
+            overlap_region = overlap > 0
+            resolved[overlap_region] = (nearest[overlap_region] == i).float()
+            result.append(resolved)
+
+        return result
 
     def _resize_mask(self, mask, target_h, target_w):
         """Resize a ComfyUI MASK tensor to target latent resolution."""
