@@ -373,6 +373,87 @@ def test_tight_masks_partition():
 
 
 # ──────────────────────────────────────────────────────────
+# Dilation tests
+# ──────────────────────────────────────────────────────────
+
+def test_dilation_increases_coverage():
+    """Dilation should expand masks and increase coverage."""
+    node = FreeFuseMaskFromImage()
+    freefuse_data = make_freefuse_data(["concept_a", "concept_b"])
+
+    # Small masks: ~10% each
+    mask_a = torch.zeros(1, 512, 512)
+    mask_a[:, 100:200, 100:200] = 1.0
+    mask_b = torch.zeros(1, 512, 512)
+    mask_b[:, 100:200, 300:400] = 1.0
+
+    # Without dilation
+    (result_0,) = node.convert(freefuse_data, mask_a, mask_2=mask_b, dilation=0)
+    cov_0 = result_0["masks"]["concept_a"].sum().item()
+
+    # With dilation
+    (result_10,) = node.convert(freefuse_data, mask_a, mask_2=mask_b, dilation=10)
+    cov_10 = result_10["masks"]["concept_a"].sum().item()
+
+    assert cov_10 > cov_0, (
+        f"Dilation=10 coverage ({cov_10}) should be > dilation=0 ({cov_0})"
+    )
+    print(f"PASS: dilation increases coverage ({cov_0:.0f} → {cov_10:.0f} pixels)")
+
+
+def test_dilation_no_overlap():
+    """After dilation, overlapping regions should be resolved (no double-assignment)."""
+    node = FreeFuseMaskFromImage()
+    freefuse_data = make_freefuse_data(["concept_a", "concept_b"])
+
+    mask_a = torch.zeros(1, 512, 512)
+    mask_a[:, 200:300, 200:300] = 1.0
+    mask_b = torch.zeros(1, 512, 512)
+    mask_b[:, 200:300, 310:410] = 1.0  # close to mask_a
+
+    # Large dilation — masks will definitely overlap before resolution
+    (result,) = node.convert(freefuse_data, mask_a, mask_2=mask_b, dilation=15)
+    mask_dict = result["masks"]
+
+    all_masks = torch.stack(list(mask_dict.values()), dim=0)
+    pixel_sum = all_masks.sum(dim=0)
+
+    if not torch.allclose(pixel_sum, torch.ones_like(pixel_sum)):
+        min_val = pixel_sum.min().item()
+        max_val = pixel_sum.max().item()
+        raise AssertionError(
+            f"Dilation with overlap resolution failed: sum range [{min_val}, {max_val}]"
+        )
+    print("PASS: dilated masks form valid partition (overlaps resolved)")
+    for name, mask in mask_dict.items():
+        coverage = mask.sum() / mask.numel() * 100
+        print(f"  {name}: {coverage:.1f}% coverage")
+
+
+def test_dilation_partition_valid():
+    """Dilated masks + background should still partition the full image."""
+    node = FreeFuseMaskFromImage()
+    freefuse_data = make_freefuse_data(["concept_a"])
+
+    mask_a = torch.zeros(1, 512, 512)
+    mask_a[:, 100:200, 100:200] = 1.0
+
+    (result,) = node.convert(freefuse_data, mask_a, dilation=5)
+    mask_dict = result["masks"]
+
+    all_masks = torch.stack(list(mask_dict.values()), dim=0)
+    pixel_sum = all_masks.sum(dim=0)
+
+    if not torch.allclose(pixel_sum, torch.ones_like(pixel_sum)):
+        min_val = pixel_sum.min().item()
+        max_val = pixel_sum.max().item()
+        raise AssertionError(
+            f"Single concept dilated: sum range [{min_val}, {max_val}]"
+        )
+    print("PASS: single dilated concept + background = valid partition")
+
+
+# ──────────────────────────────────────────────────────────
 # Run all tests
 # ──────────────────────────────────────────────────────────
 
@@ -391,6 +472,9 @@ if __name__ == "__main__":
         test_no_overlap_between_concept_masks,
         test_matches_phase1_format,
         test_tight_masks_partition,
+        test_dilation_increases_coverage,
+        test_dilation_no_overlap,
+        test_dilation_partition_valid,
     ]
 
     passed = 0
